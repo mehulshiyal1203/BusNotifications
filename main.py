@@ -200,7 +200,18 @@ def run_server():
     server = HTTPServer(("0.0.0.0", port), WebHandler)
     server.serve_forever()
 
-if __name__ == "__main__":
+# =====================================================================
+# 7. SELF-PING KEEP-ALIVE (Keeps Render free tier awake 24/7)
+# =====================================================================
+def self_ping():
+    while True:
+        time_lib.sleep(600)  # Wait 10 minutes (600 seconds)
+        try:
+            requests.get("https://busnotifications.onrender.com", timeout=10)
+        except Exception:
+            pass
+ if __name__ == "__main__":
+    threading.Thread(target=self_ping, daemon=True).start()
     threading.Thread(target=command_listener_loop, daemon=True).start()
     threading.Thread(target=tracker_loop, daemon=True).start()
     run_server()
