@@ -210,7 +210,7 @@ def self_ping():
             requests.get("https://busnotifications.onrender.com", timeout=10)
         except Exception:
             pass
- if __name__ == "__main__":
+if __name__ == "__main__":
     threading.Thread(target=self_ping, daemon=True).start()
     threading.Thread(target=command_listener_loop, daemon=True).start()
     threading.Thread(target=tracker_loop, daemon=True).start()
