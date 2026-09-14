@@ -14,7 +14,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # =====================================================================
 API_URL = "https://supabase.apps2db.uctechlabs.com/functions/v1/public-tracking"
 PAYLOAD = {
-    "token": "3ee9e4e6671dbc7286b95cf2dc8c9e287971fe43"
+    "token": "3ee9e4e46671dbc7286b95cf2dc8c9e287971fe41041d545"
 }
 
 # ntfy Channels
