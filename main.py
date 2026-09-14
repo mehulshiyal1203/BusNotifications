@@ -6,7 +6,7 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 
-# Force Indian Standard Time (IST = UTC + 5:30)
+# Indian Standard Time (IST = UTC + 5:30)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 # =====================================================================
@@ -17,36 +17,33 @@ PAYLOAD = {
     "token": "3ee9e4e46671dbc7286b95cf2dc8c9e287971fe41041d545"
 }
 
-# ntfy Channels
-ALERT_TOPIC = "bhavnagar-bus-you-99"    # Where you receive bus alerts
-COMMAND_TOPIC = "bhavnagar-bus-cmd-99"  # Where you send 'home' or 'work'
+ALERT_TOPIC = "bhavnagar-bus-you-99"
+COMMAND_TOPIC = "bhavnagar-bus-cmd-99"
 
 # =====================================================================
-# 2. SCHEDULE & ROUTE SETTINGS
+# 2. ROUTE CHECKPOINTS & RADIUS
 # =====================================================================
-# Default automated commute windows (IST 24-hour time)
 MORNING_WINDOW = (time(8, 30), time(10, 30))  # Home -> Work
 EVENING_WINDOW = (time(17, 30), time(19, 30)) # Work -> Home
 
-# --- LEG 1: MORNING (HOME -> WORK) ---
-# Bus travels: RTO Circle -> Jewels Circle -> Himalaya Mall -> Home Stop
+# 350 meters detection zone
+GATE_RADIUS_KM = 0.35
+
+# Morning Sequence: RTO Circle (1) -> Jewels Circle (2) -> Himalaya Mall (Trigger)
 MORNING_BOARDING = {"name": "Home Stop", "lat": 21.739635, "lon": 72.143801}
-MORNING_GATES = [
-    {"name": "RTO Circle",    "lat": 21.763201, "lon": 72.123069},
-    {"name": "Jewels Circle", "lat": 21.756703, "lon": 72.125713}
+MORNING_CHECKPOINTS = [
+    {"name": "RTO Circle",     "lat": 21.763201, "lon": 72.123069},
+    {"name": "Jewels Circle",  "lat": 21.756703, "lon": 72.125713},
+    {"name": "Himalaya Mall",  "lat": 21.749059, "lon": 72.135670}
 ]
-MORNING_TRIGGER = {"name": "Himalaya Mall", "lat": 21.749059, "lon": 72.135670}
 
-# --- LEG 2: EVENING (WORK -> HOME) ---
-# Bus travels: Shivaji Circle -> Nandkuvar Ba College -> GMDC -> Work Stop
+# Evening Sequence: Shivaji Circle (1) -> Nandkuvar Ba (2) -> GMDC (Trigger)
 EVENING_BOARDING = {"name": "Work Stop", "lat": 21.742990, "lon": 72.149998}
-EVENING_GATES = [
+EVENING_CHECKPOINTS = [
     {"name": "Shivaji Circle",        "lat": 21.754671, "lon": 72.162436},
-    {"name": "Nandkuvar Ba College", "lat": 21.750419, "lon": 72.158904}
+    {"name": "Nandkuvar Ba College", "lat": 21.750419, "lon": 72.158904},
+    {"name": "GMDC",                 "lat": 21.747920, "lon": 72.157140}
 ]
-EVENING_TRIGGER = {"name": "GMDC", "lat": 21.747920, "lon": 72.157140}
-
-GATE_RADIUS_KM = 0.50
 
 # =====================================================================
 # 3. HELPER FUNCTIONS
@@ -71,7 +68,7 @@ def send_alert(title, message):
         print(f"[!] Push error: {e}")
 
 # =====================================================================
-# 4. ON-DEMAND COMMAND LISTENER (ntfy integration)
+# 4. COMMAND LISTENER (ntfy app integration)
 # =====================================================================
 manual_override_mode = None
 manual_override_expiry = None
@@ -101,18 +98,28 @@ def command_listener_loop():
             time_lib.sleep(5)
 
 # =====================================================================
-# 5. TRACKING ENGINE
+# 5. SEQUENTIAL TRACKING ENGINE
 # =====================================================================
-morning_confirmed = {}
+# Progress states:
+# Stage 0: Not seen
+# Stage 1: Hit Gate 1 (e.g. Shivaji Circle)
+# Stage 2: Hit Gate 2 (e.g. Nandkuvar Ba College)
+# Trigger fires only when a Stage 2 bus reaches Gate 3 (GMDC)
+morning_progress = {}
 morning_alerted = {}
-evening_confirmed = {}
+
+evening_progress = {}
 evening_alerted = {}
 
-def process_leg(buses, gates, trigger, boarding, confirmed_dict, alerted_dict, leg_label, now):
-    # Expire stale gate confirmations older than 15 minutes
-    for bid in list(confirmed_dict.keys()):
-        if (now - confirmed_dict[bid]).total_seconds() > 900:
-            confirmed_dict.pop(bid, None)
+def process_leg_sequential(buses, checkpoints, boarding, progress_dict, alerted_dict, leg_label, now):
+    gate_1 = checkpoints[0]
+    gate_2 = checkpoints[1]
+    trigger = checkpoints[2]
+
+    # Remove inactive records older than 20 minutes
+    for bid in list(progress_dict.keys()):
+        if (now - progress_dict[bid]["updated"]).total_seconds() > 1200:
+            progress_dict.pop(bid, None)
 
     for bus in buses:
         bus_id = bus.get("name")
@@ -122,51 +129,57 @@ def process_leg(buses, gates, trigger, boarding, confirmed_dict, alerted_dict, l
         except (ValueError, KeyError, TypeError):
             continue
 
-        # 1. Upstream Gate Confirmation (Must pass RTO or Jewels Circle first)
-        for gate in gates:
-            dist_to_gate = haversine(bus_lat, bus_lon, gate["lat"], gate["lon"])
-            if dist_to_gate <= GATE_RADIUS_KM:
-                if bus_id not in confirmed_dict:
-                    print(f"[*] Bus {bus_id} confirmed upstream at: {gate['name']} ({dist_to_gate*1000:.0f}m)")
-                confirmed_dict[bus_id] = now
-                break
+        stage = progress_dict.get(bus_id, {}).get("stage", 0)
 
-        # 2. Trigger Check (Only checks buses verified from upstream)
-        if bus_id in confirmed_dict:
-            dist_to_trigger = haversine(bus_lat, bus_lon, trigger["lat"], trigger["lon"])
+        # Step 1: Must hit Gate 1 first
+        if stage == 0:
+            dist_g1 = haversine(bus_lat, bus_lon, gate_1["lat"], gate_1["lon"])
+            if dist_g1 <= GATE_RADIUS_KM:
+                progress_dict[bus_id] = {"stage": 1, "updated": now}
+                print(f"[*] Step 1/3 Confirmed: Bus {bus_id} at {gate_1['name']} ({dist_g1*1000:.0f}m)")
+
+        # Step 2: Must advance to Gate 2
+        elif stage == 1:
+            dist_g2 = haversine(bus_lat, bus_lon, gate_2["lat"], gate_2["lon"])
+            if dist_g2 <= GATE_RADIUS_KM:
+                progress_dict[bus_id] = {"stage": 2, "updated": now}
+                print(f"[*] Step 2/3 Confirmed: Bus {bus_id} at {gate_2['name']} ({dist_g2*1000:.0f}m)")
+
+        # Step 3: Trigger Alert (Only buses that passed BOTH Gate 1 and Gate 2)
+        elif stage == 2:
+            dist_trigger = haversine(bus_lat, bus_lon, trigger["lat"], trigger["lon"])
             dist_to_stop = haversine(bus_lat, bus_lon, boarding["lat"], boarding["lon"])
 
-            if dist_to_trigger <= GATE_RADIUS_KM and (bus_id not in alerted_dict):
-                print(f"[!] ALERT: Bus {bus_id} passed trigger {trigger['name']}!")
+            if dist_trigger <= GATE_RADIUS_KM and (bus_id not in alerted_dict):
+                print(f"[!] FULL ROUTE CONFIRMED: Bus {bus_id} arrived at {trigger['name']}!")
                 send_alert(
                     f"Bus Approaching ({leg_label})",
-                    f"Bus {bus_id} just passed {trigger['name']}! "
+                    f"Bus {bus_id} followed the complete corridor and passed {trigger['name']}! "
                     f"Distance to your stop: {dist_to_stop:.2f} km. Head out now."
                 )
                 alerted_dict[bus_id] = now
 
-            # Reset after departure (> 1.2 km past stop and 20 mins elapsed)
+            # Reset after bus leaves stop area (> 1.2 km away and 20 mins elapsed)
             elif dist_to_stop > 1.2 and (bus_id in alerted_dict):
                 if (now - alerted_dict[bus_id]).total_seconds() > 1200:
                     alerted_dict.pop(bus_id, None)
-                    confirmed_dict.pop(bus_id, None)
+                    progress_dict.pop(bus_id, None)
 
 def tracker_loop():
     global manual_override_mode, manual_override_expiry
-    print("[*] Two-way Bhavnagar bus engine online...")
+    print("[*] Sequential Bhavnagar bus engine online...")
 
     while True:
         try:
             now = datetime.now(IST)
             current_time = now.time()
-
             active_leg = None
 
             if manual_override_mode and manual_override_expiry:
                 if now <= manual_override_expiry:
                     active_leg = "work" if manual_override_mode == "work" else "home"
                 else:
-                    print("[*] Manual override window expired. Returning to schedule.")
+                    print("[*] Manual override expired. Returning to schedule.")
                     manual_override_mode = None
                     manual_override_expiry = None
 
@@ -186,13 +199,13 @@ def tracker_loop():
                 print(f"[*] Loop active ({active_leg.upper()}) | Active Bhavnagar e-buses: {len(buses)}")
 
                 if active_leg == "work":
-                    process_leg(buses, MORNING_GATES, MORNING_TRIGGER, MORNING_BOARDING,
-                                morning_confirmed, morning_alerted, "Going to Work", now)
+                    process_leg_sequential(buses, MORNING_CHECKPOINTS, MORNING_BOARDING,
+                                           morning_progress, morning_alerted, "Going to Work", now)
                 elif active_leg == "home":
-                    process_leg(buses, EVENING_GATES, EVENING_TRIGGER, EVENING_BOARDING,
-                                evening_confirmed, evening_alerted, "Heading Home", now)
+                    process_leg_sequential(buses, EVENING_CHECKPOINTS, EVENING_BOARDING,
+                                           evening_progress, evening_alerted, "Heading Home", now)
             else:
-                print(f"[!] Supabase API error: {resp.status_code} - Response: {resp.text}")
+                print(f"[!] API error: {resp.status_code} - Response: {resp.text}")
 
         except Exception as err:
             print(f"[!] Polling error: {err}")
@@ -218,7 +231,7 @@ def run_server():
     server.serve_forever()
 
 # =====================================================================
-# 7. SELF-PING KEEP-ALIVE (Keeps Render instance awake 24/7)
+# 7. SELF-PING KEEP-ALIVE
 # =====================================================================
 def self_ping():
     while True:
