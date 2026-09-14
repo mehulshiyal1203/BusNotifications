@@ -29,24 +29,23 @@ MORNING_WINDOW = (time(8, 30), time(10, 30))  # Home -> Work
 EVENING_WINDOW = (time(17, 30), time(19, 30)) # Work -> Home
 
 # --- LEG 1: MORNING (HOME -> WORK) ---
+# Bus travels: RTO Circle -> Jewels Circle -> Himalaya Mall -> Home Stop
 MORNING_BOARDING = {"name": "Home Stop", "lat": 21.739635, "lon": 72.143801}
 MORNING_GATES = [
     {"name": "RTO Circle",    "lat": 21.763201, "lon": 72.123069},
-    {"name": "Jewels Circle", "lat": 21.756703, "lon": 72.125713},
-    {"name": "Himalaya Mall", "lat": 21.749059, "lon": 72.135670}
+    {"name": "Jewels Circle", "lat": 21.756703, "lon": 72.125713}
 ]
 MORNING_TRIGGER = {"name": "Himalaya Mall", "lat": 21.749059, "lon": 72.135670}
 
 # --- LEG 2: EVENING (WORK -> HOME) ---
+# Bus travels: Shivaji Circle -> Nandkuvar Ba College -> GMDC -> Work Stop
 EVENING_BOARDING = {"name": "Work Stop", "lat": 21.742990, "lon": 72.149998}
 EVENING_GATES = [
-    {"name": "Shivaji Circle",         "lat": 21.754671, "lon": 72.162436},
-    {"name": "Nandkuvar Ba College",  "lat": 21.750419, "lon": 72.158904},
-    {"name": "GMDC",                  "lat": 21.747920, "lon": 72.157140}
+    {"name": "Shivaji Circle",        "lat": 21.754671, "lon": 72.162436},
+    {"name": "Nandkuvar Ba College", "lat": 21.750419, "lon": 72.158904}
 ]
 EVENING_TRIGGER = {"name": "GMDC", "lat": 21.747920, "lon": 72.157140}
 
-# Expanded from 0.20 to 0.50 km (500m) to catch fast-moving buses between GPS updates
 GATE_RADIUS_KM = 0.50
 
 # =====================================================================
@@ -110,6 +109,11 @@ evening_confirmed = {}
 evening_alerted = {}
 
 def process_leg(buses, gates, trigger, boarding, confirmed_dict, alerted_dict, leg_label, now):
+    # Expire stale gate confirmations older than 15 minutes
+    for bid in list(confirmed_dict.keys()):
+        if (now - confirmed_dict[bid]).total_seconds() > 900:
+            confirmed_dict.pop(bid, None)
+
     for bus in buses:
         bus_id = bus.get("name")
         try:
@@ -118,16 +122,16 @@ def process_leg(buses, gates, trigger, boarding, confirmed_dict, alerted_dict, l
         except (ValueError, KeyError, TypeError):
             continue
 
-        # 1. Upstream Gate Confirmation
+        # 1. Upstream Gate Confirmation (Must pass RTO or Jewels Circle first)
         for gate in gates:
             dist_to_gate = haversine(bus_lat, bus_lon, gate["lat"], gate["lon"])
             if dist_to_gate <= GATE_RADIUS_KM:
                 if bus_id not in confirmed_dict:
-                    print(f"[*] Bus {bus_id} confirmed at gate: {gate['name']} ({dist_to_gate*1000:.0f}m)")
+                    print(f"[*] Bus {bus_id} confirmed upstream at: {gate['name']} ({dist_to_gate*1000:.0f}m)")
                 confirmed_dict[bus_id] = now
                 break
 
-        # 2. Approaching Trigger Check
+        # 2. Trigger Check (Only checks buses verified from upstream)
         if bus_id in confirmed_dict:
             dist_to_trigger = haversine(bus_lat, bus_lon, trigger["lat"], trigger["lon"])
             dist_to_stop = haversine(bus_lat, bus_lon, boarding["lat"], boarding["lon"])
@@ -158,7 +162,6 @@ def tracker_loop():
 
             active_leg = None
 
-            # Check manual trigger first
             if manual_override_mode and manual_override_expiry:
                 if now <= manual_override_expiry:
                     active_leg = "work" if manual_override_mode == "work" else "home"
@@ -167,14 +170,12 @@ def tracker_loop():
                     manual_override_mode = None
                     manual_override_expiry = None
 
-            # Fall back to scheduled commute windows
             if not active_leg:
                 if MORNING_WINDOW[0] <= current_time <= MORNING_WINDOW[1]:
                     active_leg = "work"
                 elif EVENING_WINDOW[0] <= current_time <= EVENING_WINDOW[1]:
                     active_leg = "home"
 
-            # Sleep quietly outside active commute windows
             if not active_leg:
                 time_lib.sleep(30)
                 continue
