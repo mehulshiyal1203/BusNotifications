@@ -191,7 +191,7 @@ def tracker_loop():
                     process_leg(buses, EVENING_GATES, EVENING_TRIGGER, EVENING_BOARDING,
                                 evening_confirmed, evening_alerted, "Heading Home", now)
             else:
-                print(f"[!] Supabase API error: Status code {resp.status_code}")
+                print(f"[!] Supabase API error: {resp.status_code} - Response: {resp.text}")
 
         except Exception as err:
             print(f"[!] Polling error: {err}")
