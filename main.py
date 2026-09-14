@@ -1,10 +1,13 @@
 import os
 import math
 import time as time_lib
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
+
+# Force Indian Standard Time (IST = UTC + 5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # =====================================================================
 # 1. API SETTINGS
@@ -15,13 +18,13 @@ PAYLOAD = {
 }
 
 # ntfy Channels
-ALERT_TOPIC = "bhavnagar-bus-you-99"   # Channel where you receive alerts
-COMMAND_TOPIC = "bhavnagar-bus-cmd-99"  # Channel where you send 'home' or 'work'
+ALERT_TOPIC = "bhavnagar-bus-you-99"    # Where you receive bus alerts
+COMMAND_TOPIC = "bhavnagar-bus-cmd-99"  # Where you send 'home' or 'work'
 
 # =====================================================================
 # 2. SCHEDULE & ROUTE SETTINGS
 # =====================================================================
-# Default automated commute windows (24-hour time)
+# Default automated commute windows (IST 24-hour time)
 MORNING_WINDOW = (time(8, 30), time(10, 30))  # Home -> Work
 EVENING_WINDOW = (time(17, 30), time(19, 30)) # Work -> Home
 
@@ -41,10 +44,10 @@ EVENING_GATES = [
     {"name": "Nandkuvar Ba College",  "lat": 21.750419, "lon": 72.158904},
     {"name": "GMDC",                  "lat": 21.747920, "lon": 72.157140}
 ]
-# Shivaji Circle alert gives ~7-8 mins (pack up + 270m walk)
 EVENING_TRIGGER = {"name": "GMDC", "lat": 21.747920, "lon": 72.157140}
 
-GATE_RADIUS_KM = 0.20  # 200m GPS detection radius
+# Expanded from 0.20 to 0.50 km (500m) to catch fast-moving buses between GPS updates
+GATE_RADIUS_KM = 0.50
 
 # =====================================================================
 # 3. HELPER FUNCTIONS
@@ -69,10 +72,9 @@ def send_alert(title, message):
         print(f"[!] Push error: {e}")
 
 # =====================================================================
-# 4. ON-DEMAND COMMAND LISTENER (ntfy app integration)
+# 4. ON-DEMAND COMMAND LISTENER (ntfy integration)
 # =====================================================================
-# Allows waking up tracking for 45 minutes off-schedule
-manual_override_mode = None     # "work" or "home"
+manual_override_mode = None
 manual_override_expiry = None
 
 def command_listener_loop():
@@ -81,12 +83,12 @@ def command_listener_loop():
 
     while True:
         try:
-            # Streams raw incoming text from your command topic
             resp = requests.get(f"https://ntfy.sh/{COMMAND_TOPIC}/raw", stream=True, timeout=60)
             for line in resp.iter_lines():
                 if line:
                     cmd = line.decode("utf-8").strip().lower()
-                    now = datetime.now()
+                    now = datetime.now(IST)
+                    print(f"[*] Command registered from phone: {cmd}")
 
                     if "home" in cmd:
                         manual_override_mode = "home"
@@ -110,21 +112,28 @@ evening_alerted = {}
 def process_leg(buses, gates, trigger, boarding, confirmed_dict, alerted_dict, leg_label, now):
     for bus in buses:
         bus_id = bus.get("name")
-        bus_lat = float(bus["latitude"])
-        bus_lon = float(bus["longitude"])
+        try:
+            bus_lat = float(bus["latitude"])
+            bus_lon = float(bus["longitude"])
+        except (ValueError, KeyError, TypeError):
+            continue
 
-        # 1. Gate Confirmation: bus must pass an upstream gate
+        # 1. Upstream Gate Confirmation
         for gate in gates:
-            if haversine(bus_lat, bus_lon, gate["lat"], gate["lon"]) <= GATE_RADIUS_KM:
+            dist_to_gate = haversine(bus_lat, bus_lon, gate["lat"], gate["lon"])
+            if dist_to_gate <= GATE_RADIUS_KM:
+                if bus_id not in confirmed_dict:
+                    print(f"[*] Bus {bus_id} confirmed at gate: {gate['name']} ({dist_to_gate*1000:.0f}m)")
                 confirmed_dict[bus_id] = now
                 break
 
-        # 2. Trigger Check
+        # 2. Approaching Trigger Check
         if bus_id in confirmed_dict:
             dist_to_trigger = haversine(bus_lat, bus_lon, trigger["lat"], trigger["lon"])
             dist_to_stop = haversine(bus_lat, bus_lon, boarding["lat"], boarding["lon"])
 
             if dist_to_trigger <= GATE_RADIUS_KM and (bus_id not in alerted_dict):
+                print(f"[!] ALERT: Bus {bus_id} passed trigger {trigger['name']}!")
                 send_alert(
                     f"Bus Approaching ({leg_label})",
                     f"Bus {bus_id} just passed {trigger['name']}! "
@@ -132,8 +141,8 @@ def process_leg(buses, gates, trigger, boarding, confirmed_dict, alerted_dict, l
                 )
                 alerted_dict[bus_id] = now
 
-            # Reset after departure (> 1 km past stop and 20 mins elapsed)
-            elif dist_to_stop > 1.0 and (bus_id in alerted_dict):
+            # Reset after departure (> 1.2 km past stop and 20 mins elapsed)
+            elif dist_to_stop > 1.2 and (bus_id in alerted_dict):
                 if (now - alerted_dict[bus_id]).total_seconds() > 1200:
                     alerted_dict.pop(bus_id, None)
                     confirmed_dict.pop(bus_id, None)
@@ -144,10 +153,9 @@ def tracker_loop():
 
     while True:
         try:
-            now = datetime.now()
+            now = datetime.now(IST)
             current_time = now.time()
 
-            # Determine active commute direction
             active_leg = None
 
             # Check manual trigger first
@@ -155,17 +163,18 @@ def tracker_loop():
                 if now <= manual_override_expiry:
                     active_leg = "work" if manual_override_mode == "work" else "home"
                 else:
+                    print("[*] Manual override window expired. Returning to schedule.")
                     manual_override_mode = None
                     manual_override_expiry = None
 
-            # Fall back to scheduled windows if no manual override
+            # Fall back to scheduled commute windows
             if not active_leg:
                 if MORNING_WINDOW[0] <= current_time <= MORNING_WINDOW[1]:
-                    active_leg = "work"  # Home -> Work
+                    active_leg = "work"
                 elif EVENING_WINDOW[0] <= current_time <= EVENING_WINDOW[1]:
-                    active_leg = "home"  # Work -> Home
+                    active_leg = "home"
 
-            # Stand down if outside of windows
+            # Sleep quietly outside active commute windows
             if not active_leg:
                 time_lib.sleep(30)
                 continue
@@ -173,6 +182,7 @@ def tracker_loop():
             resp = requests.post(API_URL, json=PAYLOAD, timeout=10)
             if resp.status_code == 200:
                 buses = resp.json().get("positions", [])
+                print(f"[*] Loop active ({active_leg.upper()}) | Active Bhavnagar e-buses: {len(buses)}")
 
                 if active_leg == "work":
                     process_leg(buses, MORNING_GATES, MORNING_TRIGGER, MORNING_BOARDING,
@@ -180,6 +190,8 @@ def tracker_loop():
                 elif active_leg == "home":
                     process_leg(buses, EVENING_GATES, EVENING_TRIGGER, EVENING_BOARDING,
                                 evening_confirmed, evening_alerted, "Heading Home", now)
+            else:
+                print(f"[!] Supabase API error: Status code {resp.status_code}")
 
         except Exception as err:
             print(f"[!] Polling error: {err}")
@@ -195,21 +207,26 @@ class WebHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bus Tracker active and running.")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 def run_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), WebHandler)
     server.serve_forever()
 
 # =====================================================================
-# 7. SELF-PING KEEP-ALIVE (Keeps Render free tier awake 24/7)
+# 7. SELF-PING KEEP-ALIVE (Keeps Render instance awake 24/7)
 # =====================================================================
 def self_ping():
     while True:
-        time_lib.sleep(600)  # Wait 10 minutes (600 seconds)
+        time_lib.sleep(600)
         try:
             requests.get("https://busnotifications.onrender.com", timeout=10)
         except Exception:
             pass
+
 if __name__ == "__main__":
     threading.Thread(target=self_ping, daemon=True).start()
     threading.Thread(target=command_listener_loop, daemon=True).start()
