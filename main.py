@@ -23,8 +23,8 @@ COMMAND_TOPIC = "bhavnagar-bus-cmd-99"
 # =====================================================================
 # 2. ROUTE CHECKPOINTS & RADIUS
 # =====================================================================
-MORNING_WINDOW = (time(8, 30), time(10, 30))  # Home -> Work
-EVENING_WINDOW = (time(17, 30), time(19, 30)) # Work -> Home
+MORNING_WINDOW = (time(9, 30), time(11, 30))  # Home -> Work
+EVENING_WINDOW = (time(20, 00), time(21, 00)) # Work -> Home
 
 # 350 meters detection zone
 GATE_RADIUS_KM = 0.35
